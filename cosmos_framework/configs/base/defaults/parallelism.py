@@ -62,3 +62,10 @@ class ParallelismConfig:
     # the model config (mapped to MixedPrecisionPolicy.param_dtype).
     # NOTE: only used in VLM; VFM has no FSDP master.
     fsdp_master_dtype: str = "float32"
+
+    # False: each FSDP block keeps its gathered parameters from forward to backward (one all-gather
+    # per step instead of two, for more memory).
+    fsdp_reshard_after_forward: bool = True
+    # Name keys of the trainable parameters (the optimizer's ``keys_to_select``). The others are frozen
+    # and left out of FSDP, replicated on every rank so they are never all-gathered. Empty: shard all.
+    fsdp_trainable_keys: list[str] = attrs.Factory(list)

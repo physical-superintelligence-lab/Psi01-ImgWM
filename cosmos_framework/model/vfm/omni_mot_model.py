@@ -45,6 +45,7 @@ from cosmos_framework.model.vfm.utils.data_and_condition import (
 )
 from cosmos_framework.model.vfm.utils.memory import MemoryState
 from cosmos_framework.model.vfm.utils.safetensors_loader import load_language_model as load_language_model_safetensors
+from cosmos_framework.model.vfm.utils.und_kv_cache import UndKVCacheState
 from cosmos_framework.model.vfm.vlm.qwen3_vl.utils import tokenize_caption
 from cosmos_framework.data.vfm.sequence_packing import (
     PackedSequence,
@@ -238,6 +239,8 @@ class OmniMoTModel(ImaginaireModel):
             compile_config=self.config.compile,
             ac_config=self.config.activation_checkpointing,
             attention_io_layout=self.config.parallelism.attention_io_layout,
+            fsdp_reshard_after_forward=self.config.parallelism.fsdp_reshard_after_forward,
+            fsdp_trainable_keys=self.config.parallelism.fsdp_trainable_keys,
         )
 
         with misc.timer("meta to cuda and broadcast model states"):
@@ -1833,6 +1836,7 @@ class OmniMoTModel(ImaginaireModel):
         sequence_plans: list[SequencePlan],
         gen_data_clean: GenerationDataClean,
         skip_text_tokens: bool = False,
+        memory: MemoryState | None = None,
     ) -> list[torch.Tensor]:
         """
         Compute velocity prediction for a single sampling step.
@@ -1853,6 +1857,8 @@ class OmniMoTModel(ImaginaireModel):
             sequence_plans: Pre-computed sequence plans (from _prepare_inference_data)
             gen_data_clean: Pre-computed clean data (from _prepare_inference_data)
             skip_text_tokens: If True, skip text tokens (for CFG unconditional branch)
+            memory: Optional attention memory passed to the network (the text-tower KV cache
+                of ``und_kv_cache`` sampling)
 
         Returns:
             Stacked flattened velocity tensors (one per sample), each containing
@@ -1956,6 +1962,7 @@ class OmniMoTModel(ImaginaireModel):
             fps_vision=gen_data_clean.fps_vision,
             fps_action=fps_action,
             fps_sound=fps_sound,
+            memory=memory,
         )
 
         # --- Apply velocity masks ---
@@ -2176,6 +2183,8 @@ class OmniMoTModel(ImaginaireModel):
         sigma_max: float = 80.0,
         skip_text_tokens_for_cfg: bool = False,
         normalize_cfg: bool = False,
+        batched_cfg: bool = False,
+        und_kv_cache: bool = False,
         upsample_task: str | None = None,
         upsample_max_new_tokens: int = 2048,
         upsample_temperature: float | None = 0.7,
@@ -2218,6 +2227,14 @@ class OmniMoTModel(ImaginaireModel):
             sigma_max (float): Maximum sigma for the EDM sampler.
             skip_text_tokens_for_cfg (bool): If True, skip text tokens in unconditional branch.
             normalize_cfg (bool): If True, normalize the CFG output.
+            batched_cfg (bool): Run the conditional and unconditional CFG branches as one packed
+                forward per step. Vision-only; ignored with ``velocity_postprocess``,
+                ``skip_text_tokens_for_cfg``, action/sound tokens, or CFG parallelism.
+            und_kv_cache (bool): Compute the text tower once per request and reuse its keys and
+                values on later steps (``utils/und_kv_cache.py``). Needs two-way attention, one
+                vision-only forward per step (``guidance`` 1 or ``batched_cfg``), a single process,
+                and no ``velocity_postprocess`` or ``guidance_interval``; otherwise ignored with a
+                warning.
             upsample_task (str | None): Canonical V4.2 task resolved by the
                 inference caller. ``None`` disables native prompt upsampling.
                 Otherwise, the conditional captions in
@@ -2339,6 +2356,54 @@ class OmniMoTModel(ImaginaireModel):
                 gen_data_clean=gen_data_clean,
             )
 
+        vision_only = not (
+            (self.config.action_gen and any(plan.has_action for plan in sequence_plans))
+            or (self.config.sound_gen and any(plan.has_sound for plan in sequence_plans))
+        )
+        gen_data_clean_cfg_pair: GenerationDataClean | None = None
+        if (
+            batched_cfg
+            and vision_only
+            and guidance != 1.0
+            and velocity_postprocess is None
+            and not skip_text_tokens_for_cfg
+            and not (self.parallel_dims is not None and self.parallel_dims.cfgp_enabled)
+        ):
+
+            def _dup(items: Any) -> Any:
+                return None if items is None else list(items) + list(items)
+
+            gen_data_clean_cfg_pair = GenerationDataClean(
+                batch_size=gen_data_clean.batch_size * 2,
+                is_image_batch=gen_data_clean.is_image_batch,
+                raw_state_vision=_dup(gen_data_clean.raw_state_vision),
+                x0_tokens_vision=_dup(gen_data_clean.x0_tokens_vision),
+                fps_vision=(
+                    None
+                    if gen_data_clean.fps_vision is None
+                    else torch.cat([gen_data_clean.fps_vision, gen_data_clean.fps_vision], dim=0)
+                ),
+                temporal_positions_vision=_dup(gen_data_clean.temporal_positions_vision),
+                num_vision_items_per_sample=_dup(gen_data_clean.num_vision_items_per_sample),
+            )
+        und_memory: UndKVCacheState | None = None
+        if und_kv_cache:
+            one_forward_per_step = gen_data_clean_cfg_pair is not None or guidance == 1.0
+            multi_rank = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+            if (
+                vision_only
+                and self.config.joint_attn_implementation == "two_way"
+                and one_forward_per_step
+                and velocity_postprocess is None
+                and guidance_interval is None
+                and not multi_rank
+            ):
+                und_memory = UndKVCacheState(int(self.net.num_hidden_layers))
+            else:
+                log.warning(
+                    "und_kv_cache needs one vision-only forward per step in a single process; sampling without it"
+                )
+
         # Create a velocity function for a single sample (for use with self.sampler).
         # FSDP collective-sequence alignment (throughput-preset inference).
         #
@@ -2397,6 +2462,7 @@ class OmniMoTModel(ImaginaireModel):
                     sequence_plans=sequence_plans,
                     gen_data_clean=gen_data_clean,
                     skip_text_tokens=skip_text_tokens,
+                    memory=und_memory,
                 )
 
             needs_text_cfg = guidance != 1.0
@@ -2422,12 +2488,25 @@ class OmniMoTModel(ImaginaireModel):
             # Fast path: only text-CFG and no postprocess — preserve the
             # cfgp-parallel branch so two-rank CFG parallelism stays available.
             if velocity_postprocess is None:
-                cond_v, uncond_v = self._run_classifier_free_guidance(
-                    cond_tokens=cond_tokens,
-                    uncond_tokens=uncond_tokens,
-                    skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
-                    single_velocity_fn=_single_velocity_fn,
-                )
+                if gen_data_clean_cfg_pair is not None:  # batched_cfg: both branches in one forward
+                    both_v = self._get_velocity(
+                        net=net,
+                        noise_x=noise_x + noise_x,
+                        timestep=torch.cat([timestep, timestep], dim=0),
+                        text_tokens=cond_tokens + uncond_tokens,
+                        sequence_plans=sequence_plans + sequence_plans,
+                        gen_data_clean=gen_data_clean_cfg_pair,
+                        skip_text_tokens=False,
+                        memory=und_memory,
+                    )
+                    cond_v, uncond_v = both_v[: len(noise_x)], both_v[len(noise_x) :]
+                else:
+                    cond_v, uncond_v = self._run_classifier_free_guidance(
+                        cond_tokens=cond_tokens,
+                        uncond_tokens=uncond_tokens,
+                        skip_text_tokens_for_cfg=skip_text_tokens_for_cfg,
+                        single_velocity_fn=_single_velocity_fn,
+                    )
                 if not needs_text_cfg:
                     # Peers needed CFG so we ran the uncond forward to keep
                     # FSDP allgather aligned; locally we still return cond.
@@ -2847,9 +2926,15 @@ class OmniMoTModel(ImaginaireModel):
         self._normalize_video_databatch_inplace(data_batch)
         self._augment_image_dim_inplace(data_batch)  # converts each image tensor to (1, C, 1, H, W)
         raw_state_vision = data_batch[self.input_image_key if is_image_batch else self.input_video_key]
-        x0_tokens_vision = [
-            self.encode(raw_state_vision_i).contiguous().float() for raw_state_vision_i in raw_state_vision
-        ]
+        # ``vae_encode_batch`` > 1 encodes same-shaped samples together (fewer, larger VAE calls); the
+        # VAE has no cross-sample operations, so the latents are the same up to float rounding.
+        encode_batch = self.config.vae_encode_batch
+        if encode_batch > 1 and len(raw_state_vision) > 1:
+            x0_tokens_vision = self._encode_in_batches(raw_state_vision, encode_batch)
+        else:
+            x0_tokens_vision = [
+                self.encode(raw_state_vision_i).contiguous().float() for raw_state_vision_i in raw_state_vision
+            ]
 
         frame_size = data_batch.get("image_size", None)
         if frame_size is not None:
@@ -4383,6 +4468,21 @@ class OmniMoTModel(ImaginaireModel):
     @torch.no_grad()
     def encode(self, state: torch.Tensor) -> torch.Tensor:
         return self.tokenizer_vision_gen.encode(state)
+
+    def _encode_in_batches(self, raw_state_vision: list[torch.Tensor], batch: int) -> list[torch.Tensor]:
+        """``encode`` of each ``[1,C,T,H,W]`` sample, run ``batch`` same-shaped samples at a time, in order."""
+
+        by_shape: dict[tuple, list[int]] = {}
+        for index, sample in enumerate(raw_state_vision):
+            by_shape.setdefault(tuple(sample.shape), []).append(index)
+        latents: list[torch.Tensor | None] = [None] * len(raw_state_vision)
+        for indexes in by_shape.values():
+            for start in range(0, len(indexes), batch):
+                group = indexes[start : start + batch]
+                encoded = self.encode(torch.cat([raw_state_vision[i] for i in group], dim=0)).float()
+                for offset, index in enumerate(group):
+                    latents[index] = encoded[offset : offset + 1].contiguous()
+        return latents  # type: ignore[return-value]
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:

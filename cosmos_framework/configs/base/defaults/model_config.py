@@ -191,6 +191,7 @@ class OmniMoTModelConfig:
     latent_downsample_factor: int = 8
     resolution: str = "512"
     max_num_tokens_after_packing: int = 13312  # Final num tokens after sequence packing
+    vae_encode_batch: int = 1  # samples of one shape VAE-encoded per call
 
     # Attention implementation for joint understanding + generation
     # Note "two_way" and "three_way" disallow and remove "End-of-Vision" or other text token in the generation tower.

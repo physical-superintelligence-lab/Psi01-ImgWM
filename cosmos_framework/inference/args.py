@@ -128,12 +128,12 @@ class SamplingOverrides(OverridesBase):
             self.num_steps = min(self.num_steps, 1)
 
 
-InferenceResolution = Literal["256", "480", "720", "768", "1080"]
+InferenceResolution = Literal["256", "448", "480", "720", "768", "1080"]
 if TRAINING:
-    Resolution = Literal["256", "480", "704", "720", "768", "1080"]
+    Resolution = Literal["256", "448", "480", "704", "720", "768", "1080"]
 else:
     Resolution = InferenceResolution
-AspectRatio = Literal["1,1", "4,3", "3,4", "16,9", "9,16"]
+AspectRatio = Literal["1,1", "4,3", "3,4", "16,9", "9,16", "7,4"]  # 7,4: Psi0.1 image world model
 
 # Resolutions that only support image generation (num_frames == 1). Video
 # generation at these resolutions is rejected by ``_build_vision_data`` because
@@ -144,6 +144,7 @@ IMAGE_ONLY_RESOLUTIONS: frozenset[str] = frozenset({"1080"})
 MIN_NUM_FRAMES = 24
 MAX_NUM_FRAMES: dict[Resolution, int] = {
     "256": 400,
+    "448": 400,
     "480": 300,
     "704": 200,
     "720": 200,

@@ -898,6 +898,9 @@ def _impl_forward(
 
     # Derive gen_only once (outside compile) if using MemoryState
     memory_gen_only = memory.is_gen_only() if memory is not None else False
+    # A gen-only step (text-tower KV cache) shrinks the text lane to zero rows; its length is
+    # restored after the layers, since get_all_seq expects every row of the layout.
+    input_und_len = int(get_und_seq(pack).shape[0]) if memory_gen_only else 0
 
     for i, decoder_layer in enumerate(self.layers):
         # MemoryState: produce read-only MemoryValue for this layer (outside compile)
@@ -941,6 +944,12 @@ def _impl_forward(
     hidden_states_out = zeros_like(hidden_states)
     set_und_seq(hidden_states_out, self.norm(get_und_seq(hidden_states)))  # [N_und,hidden_size]
     set_gen_seq(hidden_states_out, self.norm_moe_gen(get_gen_seq(hidden_states)))  # [N_gen,hidden_size]
+
+    if memory_gen_only:
+        # Zeros: text rows are never decoded while sampling.
+        gen_seq = get_gen_seq(hidden_states_out)
+        und_zeros = gen_seq.new_zeros((input_und_len, gen_seq.shape[-1]))
+        hidden_states_out = from_und_gen_splits(und_zeros, gen_seq, hidden_states_out)
 
     return hidden_states_out, final_lbl_metadata
 
@@ -989,6 +998,10 @@ class MoTDecoderLayer(nn.Module):
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
+        # For training with the understanding tower frozen: the text lane enters every block detached.
+        # Under two-way attention it never reads generation tokens, so its backward is all unused gradients.
+        # Set through ``text_config_overrides`` (the Psi0.1 image-WM experiment's ``[custom.train]``).
+        self.detach_frozen_und = bool(getattr(config, "detach_frozen_und", False))
         self.self_attn = PackedAttentionMoT(
             config,
             layer_types=layer_types,
@@ -1039,6 +1052,8 @@ class MoTDecoderLayer(nn.Module):
             memory_value: Read-only tensor container from MemoryState.read_for_layer().
             gen_only: When True, skip the understanding pathway (und K/V come from cache).
         """
+        if self.detach_frozen_und and not gen_only and torch.is_grad_enabled():
+            input = from_und_gen_splits(get_und_seq(input).detach(), get_gen_seq(input), input)
         # Pre-Attention layernorm
         pack_norm_out = from_und_gen_splits(
             self.input_layernorm(get_und_seq(input)),  # [N_und,hidden_size]

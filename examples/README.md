@@ -16,3 +16,4 @@ This directory contains:
 | Vision SFT LoRA (Cosmos3-Super)              | `launch_sft_vision_super.sh`          |
 | Reasoner Alignment SFT                       | `launch_sft_llava_ov.sh`              |
 | Reasoner Alignment SFT (Cosmos3-Nano)        | `launch_sft_videophy2_nano.sh`        |
+| Ψ₀.₁ Image World Model (Cosmos3-Nano)       | `launch_sft_psix_image_wm.sh`         |

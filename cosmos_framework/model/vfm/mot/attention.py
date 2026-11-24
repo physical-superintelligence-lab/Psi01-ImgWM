@@ -10,6 +10,7 @@ from cosmos_framework.model.attention import (
 )
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.vfm.utils.memory import KVToStore, MemoryValue
+from cosmos_framework.model.vfm.utils.und_kv_cache import UndKVMemoryValue, cached_two_way_attention
 
 
 class SplitInfo:
@@ -241,7 +242,12 @@ def dispatch_attention(
     natten_metadata: dict | None = None,
     memory_value: MemoryValue | None = None,
 ) -> tuple[SequencePack, KVToStore | None]:
-    assert memory_value is None, "Base dispatch_attention does not handle MemoryValue"
+    if memory_value is not None:  # text-tower KV cache while sampling (utils/und_kv_cache.py)
+        assert isinstance(memory_value, UndKVMemoryValue) and not attention_mask.is_three_way
+        if memory_value.und_k is not None:
+            return cached_two_way_attention(
+                packed_query_states, packed_key_states, packed_value_states, memory_value
+            ), None
     if isinstance(attention_mask, SplitInfo) and attention_mask.is_three_way:
         output = three_way_attention(
             packed_query_states,

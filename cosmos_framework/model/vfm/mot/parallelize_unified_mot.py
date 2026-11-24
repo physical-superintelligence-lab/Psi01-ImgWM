@@ -376,9 +376,19 @@ def apply_replicated_attention_io_cp(
     return model
 
 
+def frozen_params(module: nn.Module, trainable_keys: list[str] | tuple[str, ...]) -> set:
+    """The parameters whose names contain none of ``trainable_keys`` (none when the keys are empty)."""
+
+    if not trainable_keys:
+        return set()
+    return {p for name, p in module.named_parameters() if not any(key in name for key in trainable_keys)}
+
+
 def apply_fsdp(
     model: nn.Module,
     parallel_dims: ParallelDims,
+    reshard_after_forward: bool = True,
+    trainable_keys: list[str] | tuple[str, ...] = (),
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -396,10 +406,22 @@ def apply_fsdp(
     Args:
         model (nn.Module): The model to apply data parallelism to.
         parallel_dims (ParallelDims): The device mesh to use for data parallelism and expert parallel.
+        reshard_after_forward, trainable_keys: ``ParallelismConfig.fsdp_reshard_after_forward`` and
+            ``fsdp_trainable_keys``.
     """
+    replicated = 0
     for _, block in model.model.layers.named_children():
-        fully_shard(block, mesh=parallel_dims.dp_mesh)
+        frozen = frozen_params(block, trainable_keys)
+        replicated += sum(p.numel() for p in frozen)
+        fully_shard(
+            block,
+            mesh=parallel_dims.dp_mesh,
+            reshard_after_forward=reshard_after_forward,
+            ignored_params=frozen or None,
+        )
         register_fsdp_forward_method(block, "reasoner_forward")
+    if replicated:
+        log.info(f"FSDP: {replicated / 1e9:.2f}B frozen block parameters replicated on every rank")
 
 
 def parallelize_unified_mot(
@@ -408,6 +430,8 @@ def parallelize_unified_mot(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     attention_io_layout: str = "sequence_sharded",
+    fsdp_reshard_after_forward: bool = True,
+    fsdp_trainable_keys: list[str] | tuple[str, ...] = (),
 ) -> nn.Module:
     """Optimize the model using CP, FSDP, activation checkpointing, and torch.compile.
 
@@ -427,6 +451,7 @@ def parallelize_unified_mot(
             ``save_ops_regex`` ops, mode="full", save only the outputs of
             each transformer block).
         attention_io_layout: Tensor layout at the attention boundary under CP.
+        fsdp_reshard_after_forward, fsdp_trainable_keys: see ``ParallelismConfig``.
 
     """
     if parallel_dims is not None and parallel_dims.cp_enabled:
@@ -440,5 +465,5 @@ def parallelize_unified_mot(
     if compile_config.enabled:
         apply_compile(model, compile_config)
     if parallel_dims is not None and parallel_dims.dp_enabled:
-        apply_fsdp(model, parallel_dims)
+        apply_fsdp(model, parallel_dims, fsdp_reshard_after_forward, fsdp_trainable_keys)
     return model

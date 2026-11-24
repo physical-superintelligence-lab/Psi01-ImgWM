@@ -1,0 +1,106 @@
+# base: the general-purpose Image-WM, from raw Cosmos3-Nano: every dataset, people and humanoids, none
+# oversampled. 80k steps in one cosine cycle (~1.2 passes over the rows).
+# 1 node x 8 GPUs x 64 = global batch 512:
+#   bash examples/launch_sft_psix_image_wm.sh examples/toml/sft_config/psix_image_wm/base.toml
+
+[job]
+task       = "vfm"
+experiment = "psix_image_wm_base"
+name       = "base"
+wandb_mode = "online"
+
+[model]
+max_num_tokens_after_packing = 45056
+joint_attn_implementation    = "two_way"
+precision                    = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = -1
+data_parallel_replicate_degree = 1
+
+[model.compile]
+enabled         = true
+compile_dynamic = true
+
+[model.activation_checkpointing]
+mode               = "full"
+save_ops_regex     = ["fmha"]
+preserve_rng_state = true
+determinism_check  = "default"
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+lr = 7.0e-6
+
+[scheduler]
+cycle_lengths = [80000]
+warm_up_steps = [500]
+f_start = [0.0]
+f_max = [1.0]
+f_min = [0.1]
+
+[trainer]
+max_iter = 80000
+
+[dataloader_train]
+max_samples_per_batch = 64
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 2500
+
+# ---- data: cosmos_framework/psix_wm/data_config.py --------------------------------------------
+[custom.data]
+resolution  = "448"            # the model's resolution tier
+data_root = ".data"           # under the working directory (the repo root): one directory per dataset
+cache = ".cache/psix_wm"       # likewise: index caches, query tables and validation plans
+dataset_paths = [
+    # people, natural
+    "psix_lerobot/human/egodex/train",
+    "psix_lerobot/human/egoverse_mecka/train",
+    "psix_lerobot/human/egoverse_scale/train",
+    "psix_lerobot/human/egoverse_scale_aria/train",     # separate single-arm recordings, not in Scale
+    # humanoids: G1 / H1 with RealSense, G1 with ZED Mini
+    "psix_lerobot/g1_sonic/train",
+    "psix_lerobot/h1_sonic/train",
+    "psix_lerobot/g1_sonic_neck/train",                         # G1, neck camera
+]
+# every dataset weighs its own rows (1.0 each): no oversampling
+weighting = "rows"
+# held-out datasets, only to monitor training
+val_dataset_paths = [
+    "psix_lerobot/h1_sonic/val",
+    "psix_lerobot/g1_sonic/val",
+    "psix_lerobot/g1_sonic_neck/val",
+]
+
+[custom.data.sampling]          # data_config.Sampling
+# Building rows: once per dataset, when training starts
+# store one goal row per 9 frames of a subtask; a draw starts the clip at any of those 9 frames
+stored_goal_every_frames = 9
+min_goal_seconds         = 0.8  # a goal clip starts at least this long before its subtask ends
+# Drawing samples: every sample
+goal_sample_share        = 0.36 # goals' share of a dataset's samples (when it has any)
+# each future horizon bin's weight, among those that fit (uniform over 0.8-4.0 s)
+horizon_weights          = { "0.8" = 0.125, "1.6" = 0.375, "3.2" = 0.5 }
+
+[custom.data.prompt]
+goal_forms   = { both = 0.25, subtask = 0.75 }
+future_forms = { both = 0.35, subtask = 0.45, task = 0.20 }
+
+[custom.data.validation]
+every               = 5000
+generate_every      = 5000
+loss_per_bucket     = 16
+generate_per_bucket = 4
+sampler             = "fast"     # sampler preset that generates (inference/psix_wm/sampler.py)
+
+# ---- training: cosmos_framework/configs/base/experiment/sft/psix_image_wm.py (TrainSettings) -------------
+[custom.train]
+# Speed-ups; all but vae_encode_batch rely on the understanding (text) tower being frozen.
+detach_frozen_und          = true     # no backward through the frozen text lane (trainable gradients unchanged)
+vae_encode_batch           = 32       # samples of one shape VAE-encoded per call
+fsdp_replicate_frozen      = true     # frozen weights replicated on every rank instead of sharded (no all-gather)
+fsdp_reshard_after_forward = false    # block weights stay gathered from forward to backward

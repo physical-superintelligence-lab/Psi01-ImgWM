@@ -967,6 +967,15 @@ def _finalize_data_batch(data_batch: dict[str, Any], batch_size: int, model: Omn
     return data_batch
 
 
+def batch_sample_data(samples: list[dict[str, Any]], model: OmniMoTModel) -> dict[str, Any]:
+    """One finalized batch of per-sample ``get_sample_data`` dicts, ready for ``generate_samples_from_batch``.
+
+    The public entry point for callers outside this module (the Psi0.1 image WM generator).
+    """
+
+    return _finalize_data_batch(data_batch=_merge_data_batches(samples), batch_size=len(samples), model=model)
+
+
 class SampleDataset(Dataset):
     """PyTorch map-style dataset over inference sample args.
 

@@ -3,10 +3,11 @@
 
 import torch
 from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
+from torch.distributed.tensor import DTensor
 
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
-from cosmos_framework.model.vfm.mot.parallelize_unified_mot import parallelize_unified_mot
+from cosmos_framework.model.vfm.mot.parallelize_unified_mot import frozen_params, parallelize_unified_mot
 from cosmos_framework.utils.vfm.parallelism import ParallelDims
 
 
@@ -48,6 +49,8 @@ def parallelize_vfm_network(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     attention_io_layout: str = "sequence_sharded",
+    fsdp_reshard_after_forward: bool = True,
+    fsdp_trainable_keys: list[str] | tuple[str, ...] = (),
 ) -> torch.nn.Module:
     """Optimize the model using FSDP, CP, activation checkpointing, and torch.compile.
 
@@ -64,6 +67,7 @@ def parallelize_vfm_network(
             ``parallelize_unified_mot``; ``None`` falls back to the
             ``ActivationCheckpointingConfig`` defaults.
         attention_io_layout: Tensor layout at the attention boundary under CP.
+        fsdp_reshard_after_forward, fsdp_trainable_keys: see ``ParallelismConfig``.
     """
     model.attention_io_layout = attention_io_layout
     if parallel_dims is not None and parallel_dims.cp_enabled:
@@ -75,6 +79,8 @@ def parallelize_vfm_network(
         compile_config=compile_config,
         ac_config=ac_config,
         attention_io_layout=attention_io_layout,
+        fsdp_reshard_after_forward=fsdp_reshard_after_forward,
+        fsdp_trainable_keys=fsdp_trainable_keys,
     )
 
     if compile_config.enabled and compile_config.compiled_region == "all":
@@ -85,6 +91,8 @@ def parallelize_vfm_network(
         ignored_params = set()
         if model.latent_pos_embed is not None:
             ignored_params.update(model.latent_pos_embed.parameters())
+        # Every frozen parameter stays replicated (the blocks' trainable ones are already sharded).
+        ignored_params.update(p for p in frozen_params(model, fsdp_trainable_keys) if not isinstance(p, DTensor))
 
         model = fully_shard(
             module=model,
